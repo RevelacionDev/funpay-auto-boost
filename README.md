@@ -26,7 +26,7 @@ python -m playwright install chromium
 1. Open [funpay.com](https://funpay.com) in Chrome/Edge while logged in
 2. Press **F12** → **Application** tab → **Cookies** → `funpay.com`
 3. Find `golden_key` → copy its **Value**
-
+**DO NOT share your golden_key. It gives full unrestricted access to your funpay.com account, keep it safe on your local machine!**
 > Alternatively: install the [Cookie-Editor](https://cookie-editor.com) browser extension, open FunPay, and copy `golden_key` from there.
 
 ### 3. Configure the script
