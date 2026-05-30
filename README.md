@@ -14,7 +14,7 @@ A **Python** script that automatically clicks the **"Boost offers"** button on y
 
 ### 1. Install dependencies
 
-Open **PowerShell** and run:
+Open **cmd** and run:
 
 ```powershell
 pip install playwright
