@@ -1,20 +1,20 @@
 # FunPay Auto-Boost 🚀
 
-A **Python** script that automatically clicks the **"Boost offers"** button on your [FunPay](https://funpay.com) listings every 4 hours — completely hands-free.
+A **Python** script that automatically clicks the **"Boost offers"** button on all your [FunPay](https://funpay.com) listings every 4 hours — completely hands-free.
 
-## How it works
+## Features
 
-- Uses your `golden_key` session cookie to authenticate (no password stored)
-- Opens a hidden Chromium browser via Playwright
-- Navigates to each of your offer pages and clicks Boost
-- Sleeps 4 hours, then repeats
-- Writes a log file so you can check activity anytime
+- 🔍 **Auto-detects all your offer categories** — no manual URL setup needed
+- ⏱ **Independent timing per offer** — each category tracks its own cooldown; manual boosts are handled gracefully
+- 📱 **Optional Telegram notifications** — get a message every time offers are boosted
+- 🔄 **Daily log rotation** — logs auto-clean, keeping only the last 3 days
+- 🛡 **Cloudflare-resistant** — built-in stealth patches, no extra libraries needed
 
 ## Setup
 
 ### 1. Install dependencies
 
-Open **cmd** and run:
+Open **PowerShell** and run:
 
 ```powershell
 pip install playwright
@@ -25,36 +25,62 @@ python -m playwright install chromium
 
 1. Open [funpay.com](https://funpay.com) in Chrome/Edge while logged in
 2. Press **F12** → **Application** tab → **Cookies** → `funpay.com`
-3. Find `golden_key` → copy its **Value** (**DO NOT share your golden_key. It gives full unrestricted access to your funpay.com account, keep it safe on your local machine!**)
-   
-> Alternatively: install the [Cookie-Editor](https://cookie-editor.com) browser extension, open FunPay, and copy `golden_key` from there.
+3. Find `golden_key` → copy its **Value**
 
-### 3. Configure the script
+> Alternatively: install the [Cookie-Editor](https://cookie-editor.com) browser extension → open FunPay → copy `golden_key`.
 
-Open `funpay_boost.py` and edit the top section:
+The key lasts **100 days**. When it expires, grab a fresh one the same way.
+
+### 3. Get your FunPay user ID
+
+Click your avatar on FunPay → your profile URL will be `funpay.com/en/users/XXXXX/` — the number is your ID.
+
+### 4. Configure the script
+
+Open `funpay_boost.py` and fill in the top section:
 
 ```python
-GOLDEN_KEY = "paste_your_golden_key_here"   # from step 2
+GOLDEN_KEY     = "paste_your_golden_key_here"
+FUNPAY_USER_ID = "00000"   # your ID from funpay.com/en/users/XXXXX/
 
-OFFERS_PAGES = [
-    "https://funpay.com/en/lots/YOUR_LOT_ID/trade",  # replace with your lot URLs
-]
+CHECK_INTERVAL_MINUTES = 15  # how often to check each offer
+BOOST_COOLDOWN_HOURS   = 4   # don't go below 4
 
-BOOST_EVERY_HOURS = 4    # don't go below 4 (FunPay's cooldown)
-HEADLESS          = True # True = fully hidden, False = see the browser
+# Telegram — leave empty to disable
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID   = ""
+
+HEADLESS = True   # True = fully hidden, False = see the browser
 ```
 
-### 4. Run
+That's it — the script finds your offer categories automatically.
 
-**Option A — visible terminal (minimized):**
+### 5. Optional: Telegram notifications
+
+1. Message **@BotFather** on Telegram → `/newbot` → copy the token
+2. Message **@userinfobot** on Telegram → copy your chat ID
+3. Paste both into the config above
+
+When enabled, you'll receive a Telegram message every time offers are boosted. If Telegram is not configured, notifications go to the CLI log only.
+
+### 6. Run
+
+**Option A — minimized terminal:**
 Double-click `START_BOOST.bat`
 
-**Option B — completely invisible (no window at all):**
+**Option B — completely hidden (recommended):**
 Double-click `START_BOOST.vbs`
 
-### 5. Auto-start with Windows (optional)
+### 7. Auto-start with Windows (optional)
 
-Press `Win + R`, type `shell:startup`, hit Enter — drop a shortcut to `START_BOOST.vbs` in that folder. Script will launch automatically every time Windows boots.
+Press `Win + R`, type `shell:startup`, hit Enter — drop a shortcut to `START_BOOST.vbs` in that folder. The script will launch automatically every time Windows boots.
+
+## How it works
+
+1. On startup, the script opens your profile page and automatically finds all your offer category links (the pencil icons next to each category)
+2. Every 15 minutes it checks each offer independently — if 4 hours have passed since the last boost, it boosts that offer
+3. If you manually boost an offer yourself, the script detects the button is on cooldown and reschedules accordingly
+4. Every hour it re-scans your profile in case you've added new offers
 
 ## Files
 
@@ -63,24 +89,28 @@ Press `Win + R`, type `shell:startup`, hit Enter — drop a shortcut to `START_B
 | `funpay_boost.py` | Main script |
 | `START_BOOST.bat` | Launcher — minimized terminal window |
 | `START_BOOST.vbs` | Launcher — completely hidden, no window |
+| `boost_state.json` | Auto-created — tracks last boost time per offer |
+| `funpay_boost.log` | Auto-created — activity log (rotates daily, 3 days kept) |
 
 ## Logs
 
-Activity is saved to `funpay_boost.log` in the same folder. Open it anytime to see the last boost times and any errors.
-
 ```
-2026-05-30 14:00:01  INFO      ── Cycle #1 ─────────────────────────────────────
-2026-05-30 14:00:03  INFO      Opening: https://funpay.com/en/lots/[ID]/trade
-2026-05-30 14:00:07  INFO      ✓ Boosted: https://funpay.com/en/lots/[ID]/trade
-2026-05-30 14:00:09  INFO      ✓ Boosted: https://funpay.com/en/lots/[ID]/trade
-2026-05-30 14:00:09  INFO      Sleeping 4h until next boost…
+2026-05-31 14:00:01  INFO  ── Check #1  (14:00) ──────────────────────
+2026-05-31 14:00:02  INFO  → Boosting [League of Legends Accounts]…
+2026-05-31 14:00:06  INFO  ✓ Boosted: [League of Legends Accounts]
+2026-05-31 14:00:07  INFO  → Boosting [Where Winds Meet Accounts]…
+2026-05-31 14:00:11  INFO  ✓ Boosted: [Where Winds Meet Accounts]
+2026-05-31 14:00:11  INFO  Sleeping 15m…
+2026-05-31 14:15:01  INFO  ── Check #2  (14:15) ──────────────────────
+2026-05-31 14:15:01  INFO  ⏳ [League of Legends Accounts] — next boost in 3h 45m
+2026-05-31 14:15:01  INFO  ⏳ [Where Winds Meet Accounts] — next boost in 3h 45m
 ```
 
 ## Notes
 
-- The `golden_key` cookie lasts **100 days** — when it expires, grab a fresh one from your browser
-- Stealth patches are built-in to avoid Cloudflare bot detection
-- Script only accesses your own seller pages — no scraping or abuse of FunPay's platform
+- The `golden_key` cookie lasts **100 days** — when expired, grab a fresh one from your browser
+- Stealth patches are built-in — no extra libraries, no Cloudflare issues
+- Script only accesses your own seller pages
 
 ## License
 
