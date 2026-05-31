@@ -9,7 +9,7 @@ A **Python** script that automatically clicks the **"Boost offers"** button on a
 - 📱 **Optional Telegram notifications** — get a message every time offers are boosted
 - 🔄 **Daily log rotation** — logs auto-clean, keeping only the last 3 days
 - 🛡 **Cloudflare-resistant** — built-in stealth patches, no extra libraries needed
-
+- 📝 **No password required** - uses **"golden_key"** cookie from your browser.
 ## Setup
 
 ### 1. Install dependencies
@@ -25,7 +25,7 @@ python -m playwright install chromium
 
 1. Open [funpay.com](https://funpay.com) in Chrome/Edge while logged in
 2. Press **F12** → **Application** tab → **Cookies** → `funpay.com`
-3. Find `golden_key` → copy its **Value**
+3. Find `golden_key` → copy its **Value** (do NOT share your key, it gives **full access** to your account)
 
 > Alternatively: install the [Cookie-Editor](https://cookie-editor.com) browser extension → open FunPay → copy `golden_key`.
 
