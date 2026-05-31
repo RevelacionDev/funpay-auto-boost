@@ -1,222 +1,345 @@
 """
-FunPay Auto-Boost Script  (Cloudflare-resistant)
-=================================================
-Clicks "Boost offers" on your FunPay lots every 4 hours.
-Uses golden_key cookie auth + stealth patches to avoid Cloudflare detection.
+FunPay Auto-Boost v2.0  (Cloudflare-resistant)
+===============================================
+Features:
+  - Auto-detects all offer categories from your profile page
+  - Independent per-offer timing (handles manual boosts correctly)
+  - Optional Telegram notifications
+  - Daily log rotation
 
-HOW TO GET YOUR golden_key
-───────────────────────────
-Option A (DevTools):
-  1. Open funpay.com in Chrome while logged in
-  2. Press F12  →  Application tab  →  Cookies  →  funpay.com
-  3. Find the row "golden_key" and copy its Value
+HOW TO GET YOUR golden_key:
+  1. Open funpay.com in Chrome/Edge while logged in
+  2. Press F12 → Application → Cookies → funpay.com
+  3. Copy the Value of "golden_key"
 
-Option B (extension, easier):
-  1. Install "Cookie-Editor" extension in Chrome
-  2. Go to funpay.com (logged in)  →  click the extension icon
-  3. Find golden_key  →  copy its value
+HOW TO GET YOUR user ID:
+  Open funpay.com → click your avatar → your profile URL is
+  funpay.com/en/users/XXXXX/ — the number is your ID
 
-Paste that value into GOLDEN_KEY below. It lasts 100 days.
-
-SETUP COMMANDS (run once in cmd):
+SETUP (run once in PowerShell):
   pip install playwright
-  playwright install chromium
+  python -m playwright install chromium
+
+OPTIONAL TELEGRAM SETUP:
+  1. Message @BotFather on Telegram → /newbot → copy the token
+  2. Message @userinfobot on Telegram → copy your chat ID
+  3. Fill in TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID below
 """
 
 import asyncio
+import json
 import logging
+import logging.handlers
+from datetime import datetime, timedelta
+from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# Stealth JS injected directly — patches navigator.webdriver, chrome object,
-# plugins, permissions API, and other signals Cloudflare fingerprints.
-STEALTH_SCRIPT = """
+# ══════════════════════════════════════════════════════════════
+#  ↓↓↓  CONFIGURATION — only edit this section  ↓↓↓
+# ══════════════════════════════════════════════════════════════
+
+GOLDEN_KEY     = "paste_your_golden_key_here"
+FUNPAY_USER_ID = "00000"   # numbers from funpay.com/en/users/XXXXX/
+
+# How often to check if any offer is due for a boost (minutes)
+# Script checks independently per offer — no waiting for others
+CHECK_INTERVAL_MINUTES = 15
+
+BOOST_COOLDOWN_HOURS = 4   # FunPay's cooldown — don't go lower
+
+# Telegram — leave both empty to disable entirely
+TELEGRAM_BOT_TOKEN = ""    # "123456789:ABCdef..."
+TELEGRAM_CHAT_ID   = ""    # "123456789"
+
+HEADLESS = True    # True = fully hidden, False = see the browser
+
+# ══════════════════════════════════════════════════════════════
+
+STATE_FILE = "boost_state.json"
+LOG_FILE   = "funpay_boost.log"
+
+# ── Logging: daily rotation, keep 3 days ─────────────────────
+log = logging.getLogger("FunPayBoost")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", "%Y-%m-%d %H:%M:%S")
+
+_fh = logging.handlers.TimedRotatingFileHandler(
+    LOG_FILE, when="midnight", backupCount=3, encoding="utf-8"
+)
+_fh.setFormatter(_fmt)
+_ch = logging.StreamHandler()
+_ch.setFormatter(_fmt)
+log.addHandler(_fh)
+log.addHandler(_ch)
+
+# ── Stealth patches ───────────────────────────────────────────
+STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-
 window.chrome = { runtime: {} };
-
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [1, 2, 3, 4, 5],
-});
-
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-});
-
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications' ?
-        Promise.resolve({ state: Notification.permission }) :
-        originalQuery(parameters)
-);
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+const _origQuery = window.navigator.permissions.query;
+window.navigator.permissions.query = (p) =>
+    p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origQuery(p);
 """
 
-# ══════════════════════════════════════════════════════════════
-#  ↓↓↓  ONLY EDIT THIS SECTION  ↓↓↓
-# ══════════════════════════════════════════════════════════════
-
-GOLDEN_KEY = "paste_your_golden_key_here"
-
-OFFERS_PAGES = [
-    "https://funpay.com/en/lots/[YOUR_LOT_ID_1]/trade",
-    "https://funpay.com/en/lots/[YOUR_LOT_ID_2]/trade",
-]
-
-BOOST_EVERY_HOURS = 4
-HEADLESS          = False  # Keep False unless you confirmed it works headless
-
-# ══════════════════════════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("funpay_boost.log", encoding="utf-8"),
-    ],
-)
-log = logging.getLogger("FunPayBoost")
-
-
-async def make_stealthy_page(context):
-    """Create a page with Cloudflare-evasion patches applied."""
+async def new_page(context):
     page = await context.new_page()
-    # Inject stealth patches before any page load
-    await page.add_init_script(STEALTH_SCRIPT)
+    await page.add_init_script(STEALTH_JS)
     return page
 
+# ── State: tracks last confirmed boost time per offer URL ─────
+def load_state() -> dict:
+    try:
+        if Path(STATE_FILE).exists():
+            return json.loads(Path(STATE_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
 
-async def verify_auth(page) -> bool:
-    log.info("Verifying golden_key authentication…")
-    await page.goto("https://funpay.com/en/", wait_until="domcontentloaded")
+def save_state(state: dict):
+    Path(STATE_FILE).write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def record_boost(state: dict, url: str, name: str):
+    state[url] = {"name": name, "last_boost": datetime.now().isoformat()}
+    save_state(state)
+
+def is_due(state: dict, url: str) -> bool:
+    entry = state.get(url)
+    if not entry or not entry.get("last_boost"):
+        return True
+    last = datetime.fromisoformat(entry["last_boost"])
+    return datetime.now() - last >= timedelta(hours=BOOST_COOLDOWN_HOURS)
+
+def time_remaining(state: dict, url: str) -> str:
+    entry = state.get(url)
+    if not entry or not entry.get("last_boost"):
+        return "unknown"
+    last  = datetime.fromisoformat(entry["last_boost"])
+    delta = timedelta(hours=BOOST_COOLDOWN_HOURS) - (datetime.now() - last)
+    total = max(0, int(delta.total_seconds()))
+    h, m  = divmod(total // 60, 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+# ── Telegram ──────────────────────────────────────────────────
+async def tg(msg: str):
+    """Send a Telegram message. Silently logs to CLI only if Telegram is not configured."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    import urllib.request, urllib.parse
+    try:
+        data = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text":    msg,
+            "parse_mode": "HTML",
+        }).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data=data,
+            ),
+            timeout=10,
+        )
+        log.info("Telegram notification sent.")
+    except Exception as e:
+        log.warning("Telegram failed (CLI only): %s", e)
+
+# ── Discover offer category URLs from profile page ────────────
+async def discover_offers(page, state: dict) -> list[dict]:
+    """
+    Opens the user's profile page, finds every offer category's
+    pencil/edit icon, and returns a list of {url, name} dicts.
+    """
+    profile = f"https://funpay.com/en/users/{FUNPAY_USER_ID}/"
+    log.info("Scanning profile for offers: %s", profile)
+    await page.goto(profile, wait_until="domcontentloaded")
     await asyncio.sleep(2)
 
-    # If we hit a Cloudflare challenge page, warn clearly
-    content = await page.content()
-    if "cf-browser-verification" in content or "challenge-platform" in content:
-        log.warning("Cloudflare challenge detected on homepage. Waiting 10s…")
-        await asyncio.sleep(10)
-        content = await page.content()
-        if "cf-browser-verification" in content:
-            return False  # Still blocked after waiting
+    offers = []
+    seen   = set()
 
-    # Check for logged-in indicators
-    logged_in = await page.locator(".user-link-name, .username, .header-nav-user").count()
-    return logged_in > 0
+    # Each offer category section has a pencil icon linking to /lots/ID/trade
+    # We grab the link AND the nearest heading text as the category name
+    sections = await page.locator("h3, h2").all()
+    for section in sections:
+        # Look for an <a href*="/lots/"> sibling or child within the same row
+        container = section.locator("xpath=..").first  # parent element
+        links = await container.locator('a[href*="/lots/"][href*="/trade"]').all()
+        heading_text = (await section.inner_text()).strip().split("\n")[0].strip()
 
+        for link in links:
+            href = await link.get_attribute("href")
+            if not href:
+                continue
+            url = href if href.startswith("http") else f"https://funpay.com{href}"
+            # Normalise — strip trailing slash variants
+            url = url.rstrip("/")
+            if url in seen:
+                continue
+            seen.add(url)
+            # Use existing name from state if we already know it
+            name = state.get(url, {}).get("name") or heading_text or url
+            offers.append({"url": url, "name": name})
+            log.info("  Found: [%s] → %s", name, url)
 
-async def boost_page(page, url: str) -> bool:
-    log.info("Opening: %s", url)
+    # Fallback: brute-force scan all matching anchors on the page
+    if not offers:
+        log.info("Section scan found nothing — trying full-page anchor scan…")
+        links = await page.locator('a[href*="/lots/"][href*="/trade"]').all()
+        for link in links:
+            href = await link.get_attribute("href")
+            if not href:
+                continue
+            url = (href if href.startswith("http") else f"https://funpay.com{href}").rstrip("/")
+            if url in seen:
+                continue
+            seen.add(url)
+            name = state.get(url, {}).get("name") or url
+            offers.append({"url": url, "name": name})
+            log.info("  Found (fallback): %s", url)
+
+    return offers
+
+# ── Boost a single offer page ─────────────────────────────────
+async def boost_page(page, url: str, name: str) -> bool:
+    """Returns True if the button was clicked successfully."""
     await page.goto(url, wait_until="domcontentloaded")
     await asyncio.sleep(2)
 
-    # Handle any Cloudflare challenge that might appear mid-session
-    content = await page.content()
-    if "cf-browser-verification" in content or "Just a moment" in await page.title():
-        log.warning("Cloudflare challenge on %s — waiting 15s for auto-solve…", url)
-        await asyncio.sleep(15)  # CF's JS challenge usually auto-solves in ~5s
-
-    # FunPay's Boost button carries class "js-lot-raise"
     btn = page.locator(".js-lot-raise").first
-
     try:
-        await btn.wait_for(state="visible", timeout=12_000)
+        await btn.wait_for(state="visible", timeout=10_000)
     except PlaywrightTimeout:
-        log.warning("⚠ Boost button not found on %s", url)
+        log.warning("Boost button not found on [%s] — skipping.", name)
         return False
 
     disabled = await btn.get_attribute("disabled")
     classes  = await btn.get_attribute("class") or ""
     if disabled is not None or "disabled" in classes:
-        log.info("⏸ Cooldown not expired yet on %s", url)
+        log.info("⏸ Button disabled on [%s] — manually boosted recently?", name)
         return False
 
     await btn.click()
     await asyncio.sleep(2)
 
     try:
-        msg = await page.locator("#site-message").inner_text(timeout=3_000)
-        if msg.strip():
-            log.info("   FunPay says: %s", msg.strip())
+        site_msg = await page.locator("#site-message").inner_text(timeout=3_000)
+        if site_msg.strip():
+            log.info("  FunPay says: %s", site_msg.strip())
     except Exception:
         pass
 
-    log.info("✓ Boosted: %s", url)
+    log.info("✓ Boosted: [%s]", name)
     return True
 
-
+# ── Main loop ─────────────────────────────────────────────────
 async def main():
     if GOLDEN_KEY.startswith("paste_your"):
-        print()
-        print("  ⚠  GOLDEN_KEY is not set!")
-        print("     Open funpay_boost.py in Notepad and paste your golden_key.")
-        print()
+        print("\n  ⚠  Set your GOLDEN_KEY in the script first!\n")
         input("Press Enter to close…")
         return
 
-    log.info("═" * 56)
-    log.info("  FunPay Auto-Boost  │  Every %dh  │  %d lots",
-             BOOST_EVERY_HOURS, len(OFFERS_PAGES))
-    log.info("═" * 56)
+    if FUNPAY_USER_ID == "00000":
+        print("\n  ⚠  Set your FUNPAY_USER_ID in the script first!\n")
+        print("  Open funpay.com → your avatar → check the URL for your ID number.\n")
+        input("Press Enter to close…")
+        return
+
+    log.info("═" * 58)
+    log.info("  FunPay Auto-Boost v2.0  │  Check every %dm", CHECK_INTERVAL_MINUTES)
+    log.info("  Telegram: %s", "enabled ✓" if TELEGRAM_BOT_TOKEN else "disabled")
+    log.info("═" * 58)
+
+    state = load_state()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=HEADLESS,
-            args=[
-                # Core flag: tells Chrome not to announce it's automated
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--disable-blink-features=AutomationControlled"],
         )
-
         context = await browser.new_context(
             user_agent=(
-                # A normal Windows Chrome user agent — not "HeadlessChrome"
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             locale="en-US",
-            timezone_id="Europe/Moscow",
         )
-
-        # Inject golden_key — skips the login form entirely
         await context.add_cookies([{
-            "name":     "golden_key",
-            "value":    GOLDEN_KEY,
-            "domain":   "funpay.com",
-            "path":     "/",
-            "httpOnly": True,
-            "secure":   True,
-            "sameSite": "Lax",
+            "name": "golden_key", "value": GOLDEN_KEY,
+            "domain": "funpay.com", "path": "/",
+            "httpOnly": True, "secure": True, "sameSite": "Lax",
         }])
 
-        # Each page gets stealth patches on creation
-        page = await make_stealthy_page(context)
+        page = await new_page(context)
 
-        if not await verify_auth(page):
-            log.error("✗ Auth failed — golden_key expired or Cloudflare blocked us.")
-            log.error("  → Try running with HEADLESS=False to see what's happening.")
+        # Verify auth
+        await page.goto("https://funpay.com/en/", wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+        if not await page.locator(".user-link-name, .username, .header-nav-user").count():
+            log.error("✗ golden_key invalid or expired. Get a fresh one from your browser.")
             await browser.close()
             input("Press Enter to close…")
             return
 
-        log.info("✓ Authenticated. Starting boost loop.")
+        log.info("✓ Authenticated.")
+        await tg("🚀 <b>FunPay Auto-Boost v2.0 started</b>")
 
-        cycle = 0
+        # Initial offer discovery
+        offers = await discover_offers(page, state)
+        if not offers:
+            log.error("No offers found. Check your FUNPAY_USER_ID.")
+            await browser.close()
+            return
+
+        log.info("Tracking %d offer(s).", len(offers))
+
+        check = 0
         while True:
-            cycle += 1
+            check += 1
             log.info("")
-            log.info("── Cycle #%d ─────────────────────────────────────", cycle)
+            log.info("── Check #%d  (%s) ──────────────────────────────────",
+                     check, datetime.now().strftime("%H:%M"))
 
-            for url in OFFERS_PAGES:
+            # Re-scan profile every hour (every 4 check cycles at 15m interval)
+            # to pick up any newly added offers automatically
+            if check % 4 == 0:
+                log.info("Hourly re-scan for new offers…")
+                offers = await discover_offers(page, state)
+
+            boosted_names = []
+
+            for offer in offers:
+                url, name = offer["url"], offer["name"]
+
+                if not is_due(state, url):
+                    log.info("  ⏳ [%s] — next boost in %s", name, time_remaining(state, url))
+                    continue
+
+                log.info("  → Boosting [%s]…", name)
                 try:
-                    await boost_page(page, url)
+                    clicked = await boost_page(page, url, name)
+                    if clicked:
+                        record_boost(state, url, name)
+                        boosted_names.append(name)
+                    else:
+                        # Button was disabled = cooldown still active from a manual boost.
+                        # Record now so we don't hammer the page every 15 min.
+                        record_boost(state, url, name)
+                        log.info("  Recorded cooldown start for [%s].", name)
                 except Exception as e:
-                    log.error("Error on %s: %s", url, e)
+                    log.error("  Error on [%s]: %s", name, e)
 
-            log.info("")
-            log.info("Sleeping %dh until next boost…", BOOST_EVERY_HOURS)
-            await asyncio.sleep(BOOST_EVERY_HOURS * 3600)
+            if boosted_names:
+                await tg(
+                    "✅ <b>Boosted:</b>\n" +
+                    "\n".join(f"  • {n}" for n in boosted_names)
+                )
+
+            log.info("Sleeping %dm…", CHECK_INTERVAL_MINUTES)
+            await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
 
 
 if __name__ == "__main__":
